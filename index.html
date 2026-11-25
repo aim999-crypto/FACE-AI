@@ -1,0 +1,1580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>FACE AI</title>
+  
+  <style>
+    /* Lock viewport to pure black with zero scrollbars, selection, or clutter */
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      background-color: #000000;
+      overflow: hidden;
+      overscroll-behavior: none;
+    }
+
+    #face-canvas { display:block; width:100%; height:100%; background:#000; touch-action:manipulation; }
+    #camera-preview { position:fixed; width:2px; height:2px; opacity:0; left:-10px; top:-10px; }
+    .veil { position:fixed; inset:0; z-index:50; display:flex; align-items:center; justify-content:center; background:radial-gradient(circle at 50% 40%,#10231c 0,#050807 48%,#000 100%); color:#f4fff9; font-family:system-ui,sans-serif; }
+    .panel { width:min(86vw,360px); padding:28px 24px; border:1px solid rgba(114,255,191,.24); border-radius:26px; background:rgba(9,19,15,.92); box-shadow:0 24px 90px #000,0 0 50px rgba(40,220,140,.08); text-align:center; }
+    .orb { width:62px;height:62px;border-radius:50%;margin:0 auto 18px;background:radial-gradient(circle at 35% 30%,#d8fff0,#37e69a 28%,#075c3d 72%,#02150e);box-shadow:0 0 38px rgba(55,230,154,.34); }
+    .panel h1 {font-size:20px;letter-spacing:.22em;margin:0 0 8px}
+    .panel p {font-size:12px;line-height:1.6;color:#a8c8b8;margin:0 0 20px}
+    .panel input {width:100%;padding:15px 14px;border-radius:13px;border:1px solid #315b49;background:#07110d;color:white;font-size:16px;outline:none;text-align:center}
+    .panel button {width:100%;margin-top:13px;padding:15px;border:0;border-radius:13px;background:linear-gradient(110deg,#0c8055,#39e5a0);color:#00180e;font-weight:800;font-size:14px;letter-spacing:.08em}
+    #settings {display:none}
+    #settings input {margin:7px 0}
+    #settings button.secondary {background:#13251d;color:#d7f8e8;border:1px solid #315b49}
+    .hidden {display:none!important}
+  </style>
+</head>
+<body>
+  <canvas id="face-canvas" aria-label="FACE AI"></canvas>
+  <video id="camera-preview" autoplay muted playsinline></video>
+  <section id="welcome" class="veil">
+    <div class="panel">
+      <div class="orb"></div>
+      <h1>FACE AI</h1>
+      <p>তোমার AI সঙ্গীকে কী নামে ডাকবে?</p>
+      <input id="nickname" maxlength="24" autocomplete="nickname" placeholder="তোমার nickname" />
+      <button id="enter">ENTER</button>
+    </div>
+  </section>
+  <section id="settings" class="veil">
+    <div class="panel">
+      <div class="orb"></div>
+      <h1>PRIVATE SETUP</h1>
+      <p>Gemini API key এই ডিভাইসেই রাখা হবে। কাউকে শেয়ার কোরো না।</p>
+      <input id="api-key" type="password" placeholder="Gemini API key" autocomplete="off" />
+      <button id="save-key">SAVE</button>
+      <button id="close-settings" class="secondary">CLOSE</button>
+    </div>
+  </section>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+  <script>
+    (function () {
+      "use strict";
+
+      const canvas = document.getElementById("face-canvas");
+      const ctx = canvas.getContext("2d", { alpha: false });
+
+      // Multi-directional gaze targets for automatic scanning, darting, and sweeping
+      const GAZE_WAYPOINTS = [
+        { x: -0.26, y: -0.24 }, // Reference starting gaze
+        { x: -0.84, y: -0.08 }, // Far left
+        { x: 0.84,  y: -0.08 }, // Far right
+        { x: -0.70, y: -0.72 }, // Up-left
+        { x: 0.70,  y: -0.72 }, // Up-right
+        { x: 0.00,  y: -0.78 }, // Straight up
+        { x: -0.66, y: 0.68  }, // Down-left
+        { x: 0.66,  y: 0.68  }, // Down-right
+        { x: 0.00,  y: 0.74  }, // Straight down
+        { x: -0.90, y: 0.24  }, // Low left scan
+        { x: 0.90,  y: 0.24  }, // Low right scan
+        { x: 0.00,  y: -0.04 }  // Center stare
+      ];
+
+      // Blended state presets combining:
+      // 1) Reference image (grumpy/scanning white eyes, black round pupils, slanted lids, sleek curved mouth)
+      // 2) Electric blue sparkle grin (blue glow, 4-point star eye gleam, toothy grin)
+      // 3) Crimson/red gleam grin (red eye accent & gleam, toothy grin, void darkness pulse)
+      // 4) Green slit-pupil intensity/zoom surge (green iris, vertical slit pupils, bloodshot veins, glowing brows, scale surge)
+      const STATE_PRESETS = {
+        refScan: {
+          duration: 4.5,
+          greenMix: 0.0,
+          blueMix: 0.0,
+          redMix: 0.0,
+          grinMix: 0.0,
+          starMix: 0.0,
+          slitMix: 0.0,
+          browGlowMix: 0.0,
+          veinMix: 0.0,
+          voidPulseMix: 0.0,
+          lid: 0.42,
+          slant: 0.145,
+          pupilScale: 1.0,
+          zoomScale: 1.0,
+          mouthSmile: -0.16,
+          mouthWidth: 0.94,
+          mouthTilt: -0.34,
+          jitter: 0.032,
+          breathing: 0.015
+        },
+        blueGrin: {
+          duration: 3.8,
+          greenMix: 0.0,
+          blueMix: 1.0,
+          redMix: 0.0,
+          grinMix: 1.0,
+          starMix: 1.0,
+          slitMix: 0.18,
+          browGlowMix: 0.15,
+          veinMix: 0.05,
+          voidPulseMix: 0.55,
+          lid: 0.22,
+          slant: -0.16,
+          pupilScale: 0.68,
+          zoomScale: 1.12,
+          mouthSmile: 0.85,
+          mouthWidth: 1.24,
+          mouthTilt: -0.06,
+          jitter: 0.045,
+          breathing: 0.025
+        },
+        redGrin: {
+          duration: 4.0,
+          greenMix: 0.0,
+          blueMix: 0.0,
+          redMix: 1.0,
+          grinMix: 0.92,
+          starMix: 0.88,
+          slitMix: 0.35,
+          browGlowMix: 0.22,
+          veinMix: 0.32,
+          voidPulseMix: 0.85,
+          lid: 0.28,
+          slant: -0.22,
+          pupilScale: 0.54,
+          zoomScale: 1.18,
+          mouthSmile: 0.92,
+          mouthWidth: 1.28,
+          mouthTilt: -0.04,
+          jitter: 0.052,
+          breathing: 0.03
+        },
+        greenSurge: {
+          duration: 4.6,
+          greenMix: 1.0,
+          blueMix: 0.0,
+          redMix: 0.0,
+          grinMix: 0.0,
+          starMix: 0.0,
+          slitMix: 1.0,
+          browGlowMix: 1.0,
+          veinMix: 0.92,
+          voidPulseMix: 0.35,
+          lid: 0.26,
+          slant: -0.28,
+          pupilScale: 0.42,
+          zoomScale: 1.28,
+          mouthSmile: -0.24,
+          mouthWidth: 0.86,
+          mouthTilt: -0.16,
+          jitter: 0.038,
+          breathing: 0.022
+        }
+      };
+
+      // Autonomous cycle weaving together all three styles + reference state
+      const STATE_CYCLE = [
+        "refScan",
+        "blueGrin",
+        "refScan",
+        "redGrin",
+        "greenSurge",
+        "blueGrin",
+        "greenSurge",
+        "redGrin"
+      ];
+
+      // Simulation state with spring physics and autonomous lifelike rhythm
+      const state = {
+        width: window.innerWidth,
+        height: window.innerHeight,
+        dpr: Math.min(window.devicePixelRatio || 1, 2),
+        time: 0,
+
+        // Gaze position & velocity
+        gx: -0.26,
+        gy: -0.24,
+        vx: 0,
+        vy: 0,
+        prevGx: -0.26,
+        prevGy: -0.24,
+        trailGx: -0.26,
+        trailGy: -0.24,
+
+        targetGx: -0.26,
+        targetGy: -0.24,
+
+        // Subtle pointer/touch nudge that quickly decays back to autonomous gaze
+        nudgeX: 0,
+        nudgeY: 0,
+        targetNudgeX: 0,
+        targetNudgeY: 0,
+        nudgeTimer: 0,
+
+        // Direct touch/pointer lock-on & hold/drag tracking state
+        isPointerDown: false,
+        pointerLockTimer: 0,
+        pointerHoldDuration: 0,
+        lastPointerDownTime: 0,
+        lastPointerX: null,
+        lastPointerY: null,
+        lastPointerMoveTime: 0,
+        pointerSpeed: 0,
+        pointerLookX: 0,
+        pointerLookY: 0,
+
+        // Mobile motion & tilt sensor state (DeviceOrientationEvent + DeviceMotionEvent)
+        motionEnabled: false,
+        motionPermissionRequested: false,
+        baselineBeta: null,
+        baselineGamma: null,
+        tiltGx: 0,
+        tiltGy: 0,
+        targetTiltGx: 0,
+        targetTiltGy: 0,
+        faceRoll: 0,
+        faceRollVel: 0,
+        targetFaceRoll: 0,
+        faceOffsetX: 0,
+        faceOffsetY: 0,
+        faceOffsetVelX: 0,
+        faceOffsetVelY: 0,
+        targetFaceOffsetX: 0,
+        targetFaceOffsetY: 0,
+        lastAccelX: null,
+        lastAccelY: null,
+        lastAccelZ: null,
+        shakeCooldown: 0,
+        motionActiveTimer: 0,
+
+        // Blended visual channels
+        greenMix: 0,   greenVel: 0,
+        blueMix: 0,    blueVel: 0,
+        redMix: 0,     redVel: 0,
+        grinMix: 0,    grinVel: 0,
+        starMix: 0,    starVel: 0,
+        slitMix: 0,    slitVel: 0,
+        browGlowMix: 0, browGlowVel: 0,
+        veinMix: 0,    veinVel: 0,
+        voidPulseMix: 0, voidPulseVel: 0,
+
+        lid: STATE_PRESETS.refScan.lid,
+        lidVel: 0,
+        slant: STATE_PRESETS.refScan.slant,
+        slantVel: 0,
+        pupilScale: STATE_PRESETS.refScan.pupilScale,
+        pupilVel: 0,
+        zoomScale: STATE_PRESETS.refScan.zoomScale,
+        zoomVel: 0,
+        mouthSmile: STATE_PRESETS.refScan.mouthSmile,
+        mouthSmileVel: 0,
+        mouthWidth: STATE_PRESETS.refScan.mouthWidth,
+        mouthWidthVel: 0,
+        mouthTilt: STATE_PRESETS.refScan.mouthTilt,
+        mouthTiltVel: 0,
+
+        jitter: STATE_PRESETS.refScan.jitter,
+        breathing: STATE_PRESETS.refScan.breathing,
+
+        // State cycle & gaze timers
+        cycleIdx: 0,
+        currentState: "refScan",
+        stateTimer: STATE_PRESETS.refScan.duration,
+        surgePhase: 0,
+
+        waypointIdx: 0,
+        isSweeping: false,
+        sweepAngle: 0,
+        sweepStepsLeft: 0,
+        holdTimer: 0.65,
+
+        // Micro-saccades & blinking
+        microX: 0,
+        microY: 0,
+        microTimer: 0.2,
+        isBlinking: false,
+        blinkPhase: 0,
+        blinkAmount: 0,
+        nextBlinkTimer: 2.2,
+        doubleBlinkQueued: false,
+        speaking: false,
+        speechLevel: 0
+      };
+
+      // Resize canvas to crisp device pixels without blur or scrollbars
+      function resize() {
+        try {
+          state.width = Math.max(1, window.innerWidth);
+          state.height = Math.max(1, window.innerHeight);
+          state.dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+          canvas.width = Math.round(state.width * state.dpr);
+          canvas.height = Math.round(state.height * state.dpr);
+          ctx.setTransform(state.dpr, 0, 0, state.dpr, 0, 0);
+        } catch (err) {
+          // Safe fallback if canvas sizing encounters an issue
+        }
+      }
+
+        // Trigger a natural blink (optionally followed by a quick double-blink)
+      function triggerBlink(allowDouble) {
+        if (!state.isBlinking) {
+          state.isBlinking = true;
+          state.blinkPhase = 0;
+          state.blinkAmount = 0;
+          if (allowDouble && Math.random() < 0.28) {
+            state.doubleBlinkQueued = true;
+          }
+        }
+      }
+
+      // Update blink curve
+      function updateBlink(dt) {
+        if (!state.isBlinking) {
+          state.nextBlinkTimer -= dt;
+          if (state.nextBlinkTimer <= 0) {
+            triggerBlink(true);
+            state.nextBlinkTimer = 1.9 + Math.random() * 2.8;
+          }
+          return;
+        }
+
+        state.blinkPhase += dt * 12.5;
+        if (state.blinkPhase >= 1) {
+          state.isBlinking = false;
+          state.blinkPhase = 0;
+          state.blinkAmount = 0;
+          if (state.doubleBlinkQueued) {
+            state.doubleBlinkQueued = false;
+            state.isBlinking = true;
+          }
+          return;
+        }
+
+        if (state.blinkPhase < 0.42) {
+          const t = state.blinkPhase / 0.42;
+          state.blinkAmount = 1 - Math.pow(1 - t, 2.2);
+        } else {
+          const t = (state.blinkPhase - 0.42) / 0.58;
+          state.blinkAmount = Math.pow(1 - t, 1.8);
+        }
+      }
+
+      // Advance autonomous state cycle
+      function updateStateCycle(dt) {
+        state.stateTimer -= dt;
+        if (state.stateTimer <= 0) {
+          state.cycleIdx = (state.cycleIdx + 1) % STATE_CYCLE.length;
+          const nextKey = STATE_CYCLE[state.cycleIdx];
+          state.currentState = nextKey;
+          const preset = STATE_PRESETS[nextKey];
+          state.stateTimer = preset.duration + (Math.random() - 0.5) * 0.7;
+          state.surgePhase = 0;
+
+          // Cue a lively glance or blink on expression shifts
+        if (nextKey === "greenSurge") {
+          state.isSweeping = false;
+          state.targetGx = (Math.random() - 0.5) * 0.34;
+          state.targetGy = (Math.random() - 0.5) * 0.24;
+          state.holdTimer = 0.85;
+          triggerBlink(false);
+        } else if (nextKey === "blueGrin" || nextKey === "redGrin") {
+          state.isSweeping = false;
+          state.targetGx = (Math.random() < 0.5 ? -0.42 : 0.42);
+          state.targetGy = -0.15;
+          state.holdTimer = 0.7;
+        } else {
+          triggerBlink(true);
+        }
+      }
+    }
+
+    // Map screen coordinates directly to normalized gaze coordinates centered on the face
+    function computeDirectPointerGaze(clientX, clientY) {
+      const centerX = state.width * 0.5;
+      const centerY = state.height * 0.46;
+      const spanX = Math.max(120, state.width * 0.42);
+      const spanY = Math.max(120, state.height * 0.42);
+
+      const rawX = (clientX - centerX) / spanX;
+      const rawY = (clientY - centerY) / spanY;
+
+      return {
+        x: Math.max(-0.94, Math.min(0.94, rawX)),
+        y: Math.max(-0.86, Math.min(0.86, rawY))
+      };
+    }
+
+    // Trigger a reactive expression shift based on tap speed and hold behavior
+    function triggerTouchReaction(speed, isQuickDoubleTap) {
+      if (isQuickDoubleTap) {
+        // Quick double-tap triggers a sharp mischievous grin & alert lock-on
+        state.currentState = Math.random() < 0.55 ? "blueGrin" : "redGrin";
+        state.stateTimer = Math.max(state.stateTimer, 2.6);
+        state.lidVel -= 1.4;
+        state.pupilVel -= 1.8;
+        state.zoomVel += 1.4;
+        triggerBlink(false);
+        return;
+      }
+
+      if (speed > 1.35) {
+        // Fast flick/tap: startled flinch / wide-eyed alert glance
+        state.lidVel -= 2.2;
+        state.pupilVel += 1.5;
+        state.zoomVel += 1.6;
+        if (Math.random() < 0.35) {
+          state.currentState = "greenSurge";
+          state.stateTimer = Math.max(state.stateTimer, 2.4);
+        }
+        triggerBlink(false);
+      } else if (speed < 0.35) {
+        // Deliberate touch/press: curious or intense direct attention
+        if (state.currentState === "refScan" && Math.random() < 0.45) {
+          state.currentState = Math.random() < 0.5 ? "blueGrin" : "greenSurge";
+          state.stateTimer = Math.max(state.stateTimer, 2.5);
+        }
+        state.lidVel -= 0.85;
+        state.zoomVel += 0.9;
+      } else {
+        // Medium tap/drag: lively lock-on with subtle lid lift
+        state.lidVel -= 1.25;
+        state.zoomVel += 1.1;
+      }
+    }
+
+    // Trigger a physical & emotional impulse when the mobile device is shaken or sharply moved
+    function triggerShakeReaction(intensity, impulseX, impulseY) {
+      const clampedIntensity = Math.min(2.2, Math.max(0.4, intensity));
+      state.shakeCooldown = 0.72;
+      state.motionActiveTimer = Math.max(state.motionActiveTimer, 1.45);
+      state.isSweeping = false;
+
+      // Dart gaze in response to physical movement and spring-kick the face
+      const dartX = Math.max(-0.92, Math.min(0.92, impulseX * 0.85 + (Math.random() - 0.5) * 0.45));
+      const dartY = Math.max(-0.82, Math.min(0.82, impulseY * 0.75 + (Math.random() - 0.5) * 0.35));
+      state.targetGx = dartX;
+      state.targetGy = dartY;
+      state.vx += impulseX * 5.2 * clampedIntensity;
+      state.vy += impulseY * 5.2 * clampedIntensity;
+      state.holdTimer = 0.52;
+
+      // Inertial face displacement & roll kick
+      state.faceOffsetVelX += impulseX * 260 * clampedIntensity;
+      state.faceOffsetVelY += impulseY * 220 * clampedIntensity;
+      state.faceRollVel += (impulseX * 0.55 - impulseY * 0.25) * clampedIntensity;
+
+      // Expressive reaction: startled/wide eyes on sharp motion or angry/horror surge on hard shakes
+      state.lidVel -= 2.1 * clampedIntensity;
+      state.pupilVel += (clampedIntensity > 1.25 ? -0.9 : 1.35) * clampedIntensity;
+      state.zoomVel += 1.45 * clampedIntensity;
+
+      if (clampedIntensity > 1.35) {
+        state.currentState = Math.random() < 0.55 ? "greenSurge" : "redGrin";
+        state.stateTimer = Math.max(state.stateTimer, 2.4);
+        triggerBlink(false);
+      } else if (clampedIntensity > 0.85) {
+        state.currentState = Math.random() < 0.5 ? "blueGrin" : "greenSurge";
+        state.stateTimer = Math.max(state.stateTimer, 1.9);
+      }
+    }
+
+    // Attach DeviceOrientationEvent and DeviceMotionEvent listeners safely
+    function attachMotionListeners() {
+      if (state.motionEnabled) return;
+      state.motionEnabled = true;
+
+      window.addEventListener("deviceorientation", function (e) {
+        try {
+          if (typeof e.beta !== "number" || typeof e.gamma !== "number") return;
+
+          // Calibrate initial neutral orientation on first valid sample
+          if (state.baselineBeta === null || state.baselineGamma === null) {
+            state.baselineBeta = e.beta;
+            state.baselineGamma = e.gamma;
+          }
+
+          // Gently re-center baseline if held at a sustained new angle for a long time
+          const deltaGamma = e.gamma - state.baselineGamma;
+          const deltaBeta = e.beta - state.baselineBeta;
+          state.baselineGamma += deltaGamma * 0.004;
+          state.baselineBeta += deltaBeta * 0.004;
+
+          const normX = Math.max(-1, Math.min(1, deltaGamma / 28));
+          const normY = Math.max(-1, Math.min(1, deltaBeta / 26));
+
+          // Apply subtle deadzone so minor hand tremor does not jitter gaze
+          const deadX = Math.abs(normX) < 0.05 ? 0 : normX;
+          const deadY = Math.abs(normY) < 0.05 ? 0 : normY;
+
+          state.targetTiltGx = deadX * 0.82;
+          state.targetTiltGy = deadY * 0.74;
+          state.targetFaceRoll = deadX * 0.16;
+          state.targetFaceOffsetX = deadX * 26;
+          state.targetFaceOffsetY = deadY * 20;
+
+          if (Math.hypot(deadX, deadY) > 0.08) {
+            state.motionActiveTimer = Math.max(state.motionActiveTimer, 0.95);
+          }
+        } catch (err) {
+          // Ignore malformed orientation readings
+        }
+      }, { passive: true });
+
+      window.addEventListener("devicemotion", function (e) {
+        try {
+          if (state.shakeCooldown > 0) return;
+
+          const acc = e.acceleration && (e.acceleration.x !== null || e.acceleration.y !== null || e.acceleration.z !== null)
+            ? e.acceleration
+            : e.accelerationIncludingGravity;
+          const rot = e.rotationRate;
+
+          let mx = 0;
+          let my = 0;
+          let mag = 0;
+
+          if (acc) {
+            const ax = acc.x || 0;
+            const ay = acc.y || 0;
+            const az = acc.z || 0;
+
+            if (e.acceleration && e.acceleration.x !== null) {
+              mx = ax;
+              my = -ay;
+              mag = Math.hypot(ax, ay, az);
+            } else {
+              // High-pass delta when using accelerationIncludingGravity to filter steady gravity
+              if (state.lastAccelX !== null) {
+                mx = ax - state.lastAccelX;
+                my = -(ay - state.lastAccelY);
+                const dz = az - state.lastAccelZ;
+                mag = Math.hypot(mx, my, dz);
+              }
+              state.lastAccelX = ax;
+              state.lastAccelY = ay;
+              state.lastAccelZ = az;
+            }
+          }
+
+          let rotMag = 0;
+          if (rot) {
+            const rAlpha = rot.alpha || 0;
+            const rBeta = rot.beta || 0;
+            const rGamma = rot.gamma || 0;
+            rotMag = Math.hypot(rAlpha, rBeta, rGamma);
+            if (Math.abs(rGamma) > 12 || Math.abs(rBeta) > 12) {
+              state.faceRollVel += Math.max(-3.5, Math.min(3.5, (rGamma / 90) * 1.4));
+              state.motionActiveTimer = Math.max(state.motionActiveTimer, 0.75);
+            }
+          }
+
+          // Detect shake or quick phone flick
+          if (mag > 9.5 || rotMag > 165) {
+            const accelNorm = mag / 12;
+            const rotNorm = rotMag / 220;
+            const intensity = Math.max(accelNorm, rotNorm);
+            const dirX = Math.max(-1, Math.min(1, mx / 10));
+            const dirY = Math.max(-1, Math.min(1, my / 10));
+            triggerShakeReaction(intensity, dirX, dirY);
+          } else if (mag > 3.2) {
+            // Gentle phone movement shifts subtle face offset & gaze responsiveness
+            state.faceOffsetVelX += Math.max(-140, Math.min(140, mx * 22));
+            state.faceOffsetVelY += Math.max(-120, Math.min(120, my * 22));
+            state.motionActiveTimer = Math.max(state.motionActiveTimer, 0.65);
+          }
+        } catch (err) {
+          // Ignore malformed motion readings
+        }
+      }, { passive: true });
+    }
+
+    // Request iOS/modern browser motion permission seamlessly on first user gesture
+    function requestMotionPermissionIfNeeded() {
+      if (state.motionEnabled) return;
+
+      try {
+        const needsOrientationPerm =
+          typeof DeviceOrientationEvent !== "undefined" &&
+          typeof DeviceOrientationEvent.requestPermission === "function";
+        const needsMotionPerm =
+          typeof DeviceMotionEvent !== "undefined" &&
+          typeof DeviceMotionEvent.requestPermission === "function";
+
+        if (needsOrientationPerm || needsMotionPerm) {
+          if (state.motionPermissionRequested) return;
+          state.motionPermissionRequested = true;
+
+          const promises = [];
+          if (needsOrientationPerm) {
+            promises.push(DeviceOrientationEvent.requestPermission());
+          }
+          if (needsMotionPerm) {
+            promises.push(DeviceMotionEvent.requestPermission());
+          }
+
+          Promise.allSettled(promises).then(function (results) {
+            const granted = results.some(function (r) {
+              return r.status === "fulfilled" && r.value === "granted";
+            });
+            if (granted) {
+              attachMotionListeners();
+            }
+          }).catch(function () {
+            // Fallback silently if permission is declined or unavailable
+          });
+        } else {
+          attachMotionListeners();
+        }
+      } catch (err) {
+        // Fallback silently on unsupported browsers
+      }
+    }
+
+    // Pick next multi-directional gaze target (dart, sweep, or pause)
+    function selectNextGaze() {
+        const roll = Math.random();
+
+        if (roll < 0.22 && state.currentState !== "greenSurge") {
+          state.isSweeping = true;
+          state.sweepAngle = Math.random() * Math.PI * 2;
+          state.sweepStepsLeft = 6 + Math.floor(Math.random() * 4);
+          state.holdTimer = 0.08;
+          return;
+        }
+
+        state.isSweeping = false;
+
+        let nextIdx = Math.floor(Math.random() * GAZE_WAYPOINTS.length);
+        if (nextIdx === state.waypointIdx) {
+          nextIdx = (nextIdx + 1 + Math.floor(Math.random() * (GAZE_WAYPOINTS.length - 1))) % GAZE_WAYPOINTS.length;
+        }
+        state.waypointIdx = nextIdx;
+
+        const wp = GAZE_WAYPOINTS[nextIdx];
+        const randX = (Math.random() - 0.5) * 0.14;
+        const randY = (Math.random() - 0.5) * 0.14;
+
+        state.targetGx = Math.max(-0.92, Math.min(0.92, wp.x + randX));
+        state.targetGy = Math.max(-0.82, Math.min(0.82, wp.y + randY));
+
+        const isDart = Math.random() < 0.45;
+        state.holdTimer = isDart ? (0.2 + Math.random() * 0.3) : (0.55 + Math.random() * 0.85);
+
+        if (isDart && Math.random() < 0.22) {
+          triggerBlink(false);
+        }
+      }
+
+      // Scalar spring integrator
+      function stepSpring(val, vel, target, stiffness, damping, dt) {
+        const force = (target - val) * stiffness;
+        const nextVel = (vel + force * dt) * Math.exp(-damping * dt);
+        return {
+          val: val + nextVel * dt,
+          vel: nextVel
+        };
+      }
+
+      // Update gaze, dynamic surge pulse, expression springs, and subtle pointer nudge
+      function updatePhysics(dt) {
+        updateStateCycle(dt);
+        updateBlink(dt);
+
+        if (state.shakeCooldown > 0) {
+          state.shakeCooldown = Math.max(0, state.shakeCooldown - dt);
+        }
+        if (state.motionActiveTimer > 0) {
+          state.motionActiveTimer = Math.max(0, state.motionActiveTimer - dt);
+        }
+
+        // Smoothly decay tilt & physical offset targets when motion settles
+        if (state.motionActiveTimer <= 0 && !state.isPointerDown) {
+          state.targetTiltGx *= Math.exp(-3.2 * dt);
+          state.targetTiltGy *= Math.exp(-3.2 * dt);
+          state.targetFaceRoll *= Math.exp(-3.8 * dt);
+          state.targetFaceOffsetX *= Math.exp(-4.0 * dt);
+          state.targetFaceOffsetY *= Math.exp(-4.0 * dt);
+        }
+
+        const tiltGxStep = stepSpring(state.tiltGx, 0, state.targetTiltGx, 140, 16, dt);
+        const tiltGyStep = stepSpring(state.tiltGy, 0, state.targetTiltGy, 140, 16, dt);
+        state.tiltGx = tiltGxStep.val;
+        state.tiltGy = tiltGyStep.val;
+
+        const rollStep = stepSpring(state.faceRoll, state.faceRollVel, state.targetFaceRoll, 110, 11, dt);
+        state.faceRoll = rollStep.val;
+        state.faceRollVel = rollStep.vel;
+
+        const offXStep = stepSpring(state.faceOffsetX, state.faceOffsetVelX, state.targetFaceOffsetX, 95, 10.5, dt);
+        state.faceOffsetX = offXStep.val;
+        state.faceOffsetVelX = offXStep.vel;
+
+        const offYStep = stepSpring(state.faceOffsetY, state.faceOffsetVelY, state.targetFaceOffsetY, 95, 10.5, dt);
+        state.faceOffsetY = offYStep.val;
+        state.faceOffsetVelY = offYStep.vel;
+
+        // Track active touch/pointer lock-on, hold duration, and gradual relaxation
+        if (state.isPointerDown) {
+          state.pointerHoldDuration += dt;
+          state.pointerLockTimer = Math.max(state.pointerLockTimer, 0.35);
+
+          // Prolonged hold gradually escalates intensity or locks into an intense stare
+          if (state.pointerHoldDuration > 1.25 && state.currentState === "refScan") {
+            state.currentState = Math.random() < 0.5 ? "greenSurge" : "redGrin";
+            state.stateTimer = Math.max(state.stateTimer, 2.8);
+          }
+        } else {
+          state.pointerHoldDuration = 0;
+          if (state.pointerLockTimer > 0) {
+            state.pointerLockTimer = Math.max(0, state.pointerLockTimer - dt);
+          }
+        }
+
+        const activeTrackingStrength = state.isPointerDown
+          ? 1.0
+          : Math.min(1.0, state.pointerLockTimer / 0.95);
+
+        const tiltStrength = state.isPointerDown
+          ? 0.25
+          : Math.min(1.0, state.motionActiveTimer / 0.85);
+
+        if (activeTrackingStrength > 0.01) {
+          state.isSweeping = false;
+          state.targetGx = state.pointerLookX;
+          state.targetGy = state.pointerLookY;
+          state.holdTimer = Math.max(state.holdTimer, 0.45 * activeTrackingStrength);
+        } else if (tiltStrength > 0.08 && Math.hypot(state.tiltGx, state.tiltGy) > 0.06) {
+          state.isSweeping = false;
+          state.targetGx = Math.max(-0.92, Math.min(0.92, state.tiltGx));
+          state.targetGy = Math.max(-0.82, Math.min(0.82, state.tiltGy));
+          state.holdTimer = Math.max(state.holdTimer, 0.28);
+        } else if (state.isSweeping) {
+          state.holdTimer -= dt;
+          if (state.holdTimer <= 0) {
+            state.sweepAngle += (Math.PI * 2) / 6;
+            state.targetGx = Math.cos(state.sweepAngle) * 0.84;
+            state.targetGy = Math.sin(state.sweepAngle) * 0.72;
+            state.holdTimer = 0.13;
+            state.sweepStepsLeft--;
+            if (state.sweepStepsLeft <= 0) {
+              state.isSweeping = false;
+              state.holdTimer = 0.42;
+            }
+          }
+        } else {
+          state.holdTimer -= dt;
+          if (state.holdTimer <= 0) {
+            selectNextGaze();
+          }
+        }
+
+        // Decay optional pointer/touch nudge back to zero so automatic behavior stays dominant
+        if (state.nudgeTimer > 0) {
+          state.nudgeTimer -= dt;
+          if (state.nudgeTimer <= 0) {
+            state.targetNudgeX = 0;
+            state.targetNudgeY = 0;
+          }
+        }
+
+        const nxStep = stepSpring(state.nudgeX, 0, state.targetNudgeX, 70, 12, dt);
+        const nyStep = stepSpring(state.nudgeY, 0, state.targetNudgeY, 70, 12, dt);
+        state.nudgeX = nxStep.val;
+        state.nudgeY = nyStep.val;
+
+        // Micro-saccades for organic eye liveness
+        state.microTimer -= dt;
+        if (state.microTimer <= 0) {
+          state.microX = (Math.random() - 0.5) * state.jitter;
+          state.microY = (Math.random() - 0.5) * state.jitter * 0.85;
+          state.microTimer = 0.12 + Math.random() * 0.22;
+        }
+
+        state.prevGx = state.gx;
+        state.prevGy = state.gy;
+
+        const gazeStiffness = activeTrackingStrength > 0.05
+          ? 340
+          : (state.isSweeping ? 155 : (state.currentState === "greenSurge" ? 240 : 210));
+        const gazeDamping = activeTrackingStrength > 0.05 ? 22.0 : 19.0;
+
+        const ax = (state.targetGx - state.gx) * gazeStiffness;
+        const ay = (state.targetGy - state.gy) * gazeStiffness;
+        state.vx = (state.vx + ax * dt) * Math.exp(-gazeDamping * dt);
+        state.vy = (state.vy + ay * dt) * Math.exp(-gazeDamping * dt);
+        state.gx += state.vx * dt;
+        state.gy += state.vy * dt;
+
+        // Smooth motion-blur ghost trail for fast saccades/sweeps
+        const trailRate = 1 - Math.exp(-26 * dt);
+        state.trailGx += (state.gx - state.trailGx) * trailRate;
+        state.trailGy += (state.gy - state.trailGy) * trailRate;
+
+        const preset = STATE_PRESETS[state.currentState];
+        state.surgePhase += dt * 4.2;
+        const surgeWave = Math.sin(state.surgePhase);
+        const dynamicZoomTarget = preset.zoomScale + (state.currentState === "greenSurge" ? surgeWave * 0.11 : surgeWave * 0.03);
+
+        const k = 48;
+        const d = 13.0;
+
+        const sGreen = stepSpring(state.greenMix, state.greenVel, preset.greenMix, k, d, dt);
+        state.greenMix = sGreen.val; state.greenVel = sGreen.vel;
+
+        const sBlue = stepSpring(state.blueMix, state.blueVel, preset.blueMix, k, d, dt);
+        state.blueMix = sBlue.val; state.blueVel = sBlue.vel;
+
+        const sRed = stepSpring(state.redMix, state.redVel, preset.redMix, k, d, dt);
+        state.redMix = sRed.val; state.redVel = sRed.vel;
+
+        const sGrin = stepSpring(state.grinMix, state.grinVel, preset.grinMix, k * 1.15, d, dt);
+        state.grinMix = sGrin.val; state.grinVel = sGrin.vel;
+
+        const sStar = stepSpring(state.starMix, state.starVel, preset.starMix, k * 1.2, d, dt);
+        state.starMix = sStar.val; state.starVel = sStar.vel;
+
+        const sSlit = stepSpring(state.slitMix, state.slitVel, preset.slitMix, k, d, dt);
+        state.slitMix = sSlit.val; state.slitVel = sSlit.vel;
+
+        const sBrow = stepSpring(state.browGlowMix, state.browGlowVel, preset.browGlowMix, k, d, dt);
+        state.browGlowMix = sBrow.val; state.browGlowVel = sBrow.vel;
+
+        const sVein = stepSpring(state.veinMix, state.veinVel, preset.veinMix, k * 0.9, d, dt);
+        state.veinMix = sVein.val; state.veinVel = sVein.vel;
+
+        const sVoid = stepSpring(state.voidPulseMix, state.voidPulseVel, preset.voidPulseMix, k * 0.85, d, dt);
+        state.voidPulseMix = sVoid.val; state.voidPulseVel = sVoid.vel;
+
+        const sLid = stepSpring(state.lid, state.lidVel, preset.lid, k * 1.25, d, dt);
+        state.lid = sLid.val; state.lidVel = sLid.vel;
+
+        const sSlant = stepSpring(state.slant, state.slantVel, preset.slant, k * 1.2, d, dt);
+        state.slant = sSlant.val; state.slantVel = sSlant.vel;
+
+        const sPupil = stepSpring(state.pupilScale, state.pupilVel, preset.pupilScale, k * 1.25, d, dt);
+        state.pupilScale = sPupil.val; state.pupilVel = sPupil.vel;
+
+        const sZoom = stepSpring(state.zoomScale, state.zoomVel, dynamicZoomTarget, k * 0.95, d, dt);
+        state.zoomScale = sZoom.val; state.zoomVel = sZoom.vel;
+
+        const sSmile = stepSpring(state.mouthSmile, state.mouthSmileVel, preset.mouthSmile, k * 1.15, d, dt);
+        state.mouthSmile = sSmile.val; state.mouthSmileVel = sSmile.vel;
+
+        const sMWidth = stepSpring(state.mouthWidth, state.mouthWidthVel, preset.mouthWidth, k * 1.15, d, dt);
+        state.mouthWidth = sMWidth.val; state.mouthWidthVel = sMWidth.vel;
+
+        const sMTilt = stepSpring(state.mouthTilt, state.mouthTiltVel, preset.mouthTilt, k * 1.15, d, dt);
+        state.mouthTilt = sMTilt.val; state.mouthTiltVel = sMTilt.vel;
+
+        const blend = 1 - Math.exp(-6 * dt);
+        state.jitter += (preset.jitter - state.jitter) * blend;
+        state.breathing += (preset.breathing - state.breathing) * blend;
+      }
+
+      // Draw a crisp 4-point star sparkle / gleam over an eye
+      function drawFourPointStar(x, y, rx, ry, color, glowColor, alpha) {
+        if (alpha <= 0.01) return;
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.globalAlpha = Math.min(1, alpha);
+
+        if (glowColor) {
+          ctx.shadowColor = glowColor;
+          ctx.shadowBlur = Math.max(8, (rx + ry) * 0.45);
+        }
+
+        const waistX = rx * 0.22;
+        const waistY = ry * 0.22;
+
+        ctx.beginPath();
+        ctx.moveTo(0, -ry);
+        ctx.quadraticCurveTo(waistX, -waistY, rx, 0);
+        ctx.quadraticCurveTo(waistX, waistY, 0, ry);
+        ctx.quadraticCurveTo(-waistX, waistY, -rx, 0);
+        ctx.quadraticCurveTo(-waistX, -waistY, 0, -ry);
+        ctx.closePath();
+
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // Draw delicate branching bloodshot veins inside the sclera during green/crimson surges
+      function drawVeins(eyeW, eyeH, isLeft, alpha) {
+        if (alpha <= 0.02) return;
+        ctx.save();
+        ctx.globalAlpha = Math.min(0.85, alpha);
+        ctx.strokeStyle = "rgba(220, 32, 48, 0.85)";
+        ctx.lineWidth = Math.max(1.0, eyeW * 0.014);
+        ctx.lineCap = "round";
+
+        const dir = isLeft ? -1 : 1;
+        const originX = dir * eyeW * 0.86;
+        const originY = -eyeH * 0.08;
+
+        ctx.beginPath();
+        ctx.moveTo(originX, originY);
+        ctx.lineTo(originX - dir * eyeW * 0.28, originY - eyeH * 0.14);
+        ctx.lineTo(originX - dir * eyeW * 0.46, originY - eyeH * 0.08);
+        ctx.moveTo(originX - dir * eyeW * 0.22, originY - eyeH * 0.11);
+        ctx.lineTo(originX - dir * eyeW * 0.36, originY - eyeH * 0.28);
+
+        ctx.moveTo(originX, originY + eyeH * 0.16);
+        ctx.lineTo(originX - dir * eyeW * 0.30, originY + eyeH * 0.24);
+        ctx.lineTo(originX - dir * eyeW * 0.48, originY + eyeH * 0.36);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Draw one eye fusing the reference white eye, electric blue/red sparkle grin accents, and green slit iris
+      function drawEye(cx, cy, eyeW, eyeH, isLeft, lookX, lookY, trailLookX, trailLookY, blinkAmt, squashX, squashY) {
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.scale(squashX, squashY);
+
+        const topY = -eyeH * 0.56;
+        const botY = eyeH * 0.72;
+
+        // Eye contour path
+        ctx.beginPath();
+        ctx.moveTo(-eyeW, topY);
+        ctx.quadraticCurveTo(0, topY - eyeH * 0.04, eyeW, topY);
+        ctx.bezierCurveTo(
+          eyeW * 1.04, botY * 0.54,
+          eyeW * 0.62, botY,
+          0, botY
+        );
+        ctx.bezierCurveTo(
+          -eyeW * 0.62, botY,
+          -eyeW * 1.04, botY * 0.54,
+          -eyeW, topY
+        );
+        ctx.closePath();
+
+        // Subtle outer aura for blue, red, or green surge modes
+        const blueGlow = state.blueMix * 0.85;
+        const redGlow = state.redMix * 0.85;
+        const greenGlow = state.greenMix * 0.85;
+        if (blueGlow > 0.05 || redGlow > 0.05 || greenGlow > 0.05) {
+          ctx.save();
+          if (greenGlow >= blueGlow && greenGlow >= redGlow) {
+            ctx.shadowColor = "rgba(74, 255, 64, 0.75)";
+            ctx.shadowBlur = eyeW * 0.34 * greenGlow;
+            ctx.globalAlpha = greenGlow * 0.45;
+          } else if (blueGlow >= redGlow) {
+            ctx.shadowColor = "rgba(64, 156, 255, 0.85)";
+            ctx.shadowBlur = eyeW * 0.38 * blueGlow;
+            ctx.globalAlpha = blueGlow * 0.5;
+          } else {
+            ctx.shadowColor = "rgba(255, 42, 42, 0.85)";
+            ctx.shadowBlur = eyeW * 0.38 * redGlow;
+            ctx.globalAlpha = redGlow * 0.5;
+          }
+          ctx.fillStyle = "#FFFFFF";
+          ctx.fill();
+          ctx.restore();
+        }
+
+        // Base white sclera
+        ctx.fillStyle = "#FFFFFF";
+        ctx.fill();
+
+        ctx.save();
+        ctx.clip();
+
+        // Tint sclera toward crimson or electric blue during grin modes
+        if (state.blueMix > 0.02) {
+          ctx.fillStyle = `rgba(170, 215, 255, ${state.blueMix * 0.42})`;
+          ctx.fillRect(-eyeW * 1.2, -eyeH * 1.2, eyeW * 2.4, eyeH * 2.4);
+        }
+        if (state.redMix > 0.02) {
+          ctx.fillStyle = `rgba(255, 62, 62, ${state.redMix * 0.45})`;
+          ctx.fillRect(-eyeW * 1.2, -eyeH * 1.2, eyeW * 2.4, eyeH * 2.4);
+        }
+
+        // Bloodshot sclera veins
+        drawVeins(eyeW, eyeH, isLeft, state.veinMix);
+
+        // Motion-blur ghost pupil during rapid saccades/sweeps
+        const maxMoveX = eyeW * 0.44;
+        const maxMoveY = eyeH * 0.34;
+        const speedMag = Math.hypot(state.vx, state.vy);
+        if (speedMag > 1.8) {
+          const tpx = trailLookX * maxMoveX;
+          const tpy = trailLookY * maxMoveY;
+          const tr = Math.max(3, Math.min(eyeW, eyeH) * 0.42 * state.pupilScale);
+          ctx.beginPath();
+          ctx.arc(tpx, tpy, tr, 0, Math.PI * 2);
+          ctx.fillStyle = state.greenMix > 0.5 ? "rgba(62, 235, 38, 0.24)" : "rgba(0, 0, 0, 0.22)";
+          ctx.fill();
+        }
+
+        const px = lookX * maxMoveX;
+        const py = lookY * maxMoveY;
+        const baseR = Math.min(eyeW, eyeH) * 0.43;
+
+        // Glowing green iris & vertical slit pupil when greenMix blends in
+        if (state.greenMix > 0.02) {
+          const irisR = baseR * (0.95 + state.greenMix * 0.14);
+          const grad = ctx.createRadialGradient(px, py, irisR * 0.12, px, py, irisR);
+          grad.addColorStop(0, "rgba(195, 255, 80, 1)");
+          grad.addColorStop(0.55, "rgba(76, 235, 28, 1)");
+          grad.addColorStop(1, "rgba(22, 118, 10, 1)");
+
+          ctx.save();
+          ctx.globalAlpha = Math.min(1, state.greenMix * 1.15);
+          ctx.beginPath();
+          ctx.arc(px, py, irisR, 0, Math.PI * 2);
+          ctx.fillStyle = grad;
+          ctx.fill();
+
+          // Vertical cat/monster slit pupil
+          const slitW = Math.max(2.2, irisR * (0.28 - state.slitMix * 0.12));
+          const slitH = irisR * 0.92;
+          ctx.beginPath();
+          ctx.moveTo(px, py - slitH);
+          ctx.quadraticCurveTo(px + slitW, py, px, py + slitH);
+          ctx.quadraticCurveTo(px - slitW, py, px, py - slitH);
+          ctx.closePath();
+          ctx.fillStyle = "#040802";
+          ctx.fill();
+          ctx.restore();
+        }
+
+        // Standard black pupil (fades out as green iris takes over)
+        const blackPupilAlpha = Math.max(0, 1 - state.greenMix * 0.96);
+        if (blackPupilAlpha > 0.02) {
+          const pupilR = Math.max(2.5, baseR * state.pupilScale);
+          ctx.save();
+          ctx.globalAlpha = blackPupilAlpha;
+          ctx.beginPath();
+          ctx.arc(px, py, pupilR, 0, Math.PI * 2);
+          ctx.fillStyle = "#000000";
+          ctx.fill();
+          ctx.restore();
+        }
+
+        // 4-point star sparkle/gleam on the right eye (like video_1.mp4)
+        if (!isLeft && state.starMix > 0.02) {
+          const starColor = state.redMix > 0.5 ? "#FF2B2B" : "#FFFFFF";
+          const starGlow = state.redMix > 0.5 ? "rgba(255, 40, 40, 0.9)" : "rgba(110, 185, 255, 0.9)";
+          drawFourPointStar(
+            eyeW * 0.34,
+            -eyeH * 0.06,
+            eyeW * 0.44 * state.starMix,
+            eyeH * 0.56 * state.starMix,
+            starColor,
+            starGlow,
+            state.starMix * (1 - blinkAmt * 0.8)
+          );
+        }
+
+        // Slanted top eyelid in pure black
+        const effectiveDrop = Math.min(1.06, Math.max(-0.2, state.lid + blinkAmt * (1.05 - state.lid)));
+        const spanY = botY - topY;
+        const lidCenterY = topY + spanY * effectiveDrop;
+        const slopePx = eyeH * state.slant * (1 - blinkAmt * 0.85);
+        const leftY = isLeft ? lidCenterY - slopePx : lidCenterY + slopePx;
+        const rightY = isLeft ? lidCenterY + slopePx : lidCenterY - slopePx;
+
+        ctx.beginPath();
+        ctx.moveTo(-eyeW * 1.35, topY - eyeH * 0.75);
+        ctx.lineTo(eyeW * 1.35, topY - eyeH * 0.75);
+        ctx.lineTo(eyeW * 1.35, rightY);
+        ctx.quadraticCurveTo(0, (leftY + rightY) * 0.5 + eyeH * 0.02, -eyeW * 1.35, leftY);
+        ctx.closePath();
+        ctx.fillStyle = "#000000";
+        ctx.fill();
+
+        ctx.restore(); // End eye clip
+
+        // Glowing sharp brow/lid edge accent in green surge or blue/red grin modes
+        const accentStrength = Math.max(state.browGlowMix, state.blueMix * 0.65, state.redMix * 0.7);
+        if (accentStrength > 0.05 && blinkAmt < 0.85) {
+          ctx.save();
+          ctx.globalAlpha = Math.min(0.95, accentStrength);
+          let strokeCol = "#7CFF3B";
+          let shadowCol = "rgba(110, 255, 50, 0.85)";
+          if (state.blueMix > state.greenMix && state.blueMix >= state.redMix) {
+            strokeCol = "#80C8FF";
+            shadowCol = "rgba(64, 156, 255, 0.9)";
+          } else if (state.redMix > state.greenMix && state.redMix > state.blueMix) {
+            strokeCol = "#FF4848";
+            shadowCol = "rgba(255, 42, 42, 0.9)";
+          }
+
+          ctx.strokeStyle = strokeCol;
+          ctx.shadowColor = shadowCol;
+          ctx.shadowBlur = Math.max(6, eyeW * 0.14);
+          ctx.lineWidth = Math.max(2.0, eyeH * 0.065);
+          ctx.lineCap = "round";
+
+          ctx.beginPath();
+          ctx.moveTo(-eyeW * 0.98, leftY);
+          ctx.quadraticCurveTo(0, (leftY + rightY) * 0.5 + eyeH * 0.02, eyeW * 0.98, rightY);
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        ctx.restore();
+      }
+
+      // Draw mouth blending sleek tapered curve (reference) with sharp toothy grin (video_1.mp4)
+      function drawMouth(cx, cy, unit, lookX, lookY, squashX, squashY) {
+        ctx.save();
+        const shiftX = lookX * unit * 0.06;
+        const shiftY = lookY * unit * 0.035;
+        ctx.translate(cx + shiftX, cy + shiftY);
+        ctx.scale(squashX, squashY);
+
+        const grin = Math.max(0, Math.min(1, state.grinMix));
+
+        // Sleek tapered white curved mouth (reference image style)
+        if (grin < 0.96) {
+          ctx.save();
+          ctx.globalAlpha = Math.max(0, 1 - grin * 1.05);
+          ctx.rotate(state.mouthTilt);
+
+          const halfW = unit * state.mouthWidth;
+          const curveArch = -unit * 0.16 + state.mouthSmile * unit * 0.25;
+          const startThick = Math.max(2.0, unit * 0.015);
+          const midThick = Math.max(4.5, unit * 0.048);
+          const endThick = Math.max(2.2, unit * 0.018);
+
+          ctx.beginPath();
+          ctx.moveTo(-halfW, -startThick * 0.5);
+          ctx.quadraticCurveTo(0, curveArch - midThick * 0.5, halfW, -endThick * 0.5);
+          ctx.quadraticCurveTo(0, curveArch + midThick * 0.5, -halfW, startThick * 0.5);
+          ctx.closePath();
+
+          ctx.fillStyle = "#FFFFFF";
+          ctx.fill();
+          ctx.restore();
+        }
+
+        // Sharp toothy grin (video_1.mp4 style)
+        if (grin > 0.04) {
+          ctx.save();
+          ctx.globalAlpha = grin;
+
+          let grinGlowColor = "rgba(90, 175, 255, 0.72)";
+          if (state.redMix > 0.45) {
+            grinGlowColor = "rgba(255, 55, 55, 0.68)";
+          } else if (state.greenMix > 0.45) {
+            grinGlowColor = "rgba(95, 255, 70, 0.65)";
+          }
+
+          ctx.shadowColor = grinGlowColor;
+          ctx.shadowBlur = unit * 0.16;
+
+          const mw = unit * 1.34;
+          const mh = unit * 0.56;
+
+          // Outer grin silhouette
+          ctx.beginPath();
+          ctx.moveTo(-mw, -mh * 0.28);
+          ctx.quadraticCurveTo(0, -mh * 0.02, mw, -mh * 0.28);
+          ctx.quadraticCurveTo(mw * 0.85, mh * 0.76, 0, mh * 0.86);
+          ctx.quadraticCurveTo(-mw * 0.85, mh * 0.76, -mw, -mh * 0.28);
+          ctx.closePath();
+          ctx.fillStyle = "#FFFFFF";
+          ctx.fill();
+
+          // Dark interior mouth cavity with sharp alternating upper & lower teeth
+          ctx.save();
+          ctx.clip();
+
+          const teethCount = 11;
+          const stepW = (mw * 1.88) / teethCount;
+          const startX = -mw * 0.94;
+
+          ctx.beginPath();
+          ctx.moveTo(-mw * 1.1, -mh * 0.4);
+          ctx.lineTo(mw * 1.1, -mh * 0.4);
+          ctx.lineTo(mw * 1.1, mh * 0.95);
+          ctx.lineTo(-mw * 1.1, mh * 0.95);
+          ctx.closePath();
+
+          // Cut out sharp triangular teeth in white against dark gum/mouth void
+          ctx.fillStyle = "#08080A";
+          ctx.fill();
+
+          ctx.shadowBlur = 0;
+          ctx.fillStyle = "#FFFFFF";
+
+          // Top sharp fangs
+          for (let i = 0; i < teethCount; i++) {
+            const tx0 = startX + i * stepW;
+            const txMid = tx0 + stepW * 0.5;
+            const tx1 = tx0 + stepW;
+            const archDrop = Math.cos(((txMid / mw) * Math.PI) * 0.45) * mh * 0.14;
+            const tipY = -mh * 0.05 + archDrop + mh * 0.34;
+
+            ctx.beginPath();
+            ctx.moveTo(tx0, -mh * 0.15);
+            ctx.lineTo(txMid, tipY);
+            ctx.lineTo(tx1, -mh * 0.15);
+            ctx.closePath();
+            ctx.fill();
+          }
+
+          // Bottom sharp fangs
+          for (let i = 0; i < teethCount - 1; i++) {
+            const bx0 = startX + (i + 0.5) * stepW;
+            const bxMid = bx0 + stepW * 0.5;
+            const bx1 = bx0 + stepW;
+            const archLift = Math.cos(((bxMid / mw) * Math.PI) * 0.45) * mh * 0.14;
+            const tipY = mh * 0.82 - archLift - mh * 0.30;
+
+            ctx.beginPath();
+            ctx.moveTo(bx0, mh * 0.88);
+            ctx.lineTo(bxMid, tipY);
+            ctx.lineTo(bx1, mh * 0.88);
+            ctx.closePath();
+            ctx.fill();
+          }
+
+          ctx.restore();
+          ctx.restore();
+        }
+
+        if (state.speaking) {
+          const open = 0.12 + state.speechLevel * 0.42;
+          ctx.save();
+          ctx.translate(0, unit * 0.035);
+          ctx.beginPath();
+          ctx.ellipse(0, 0, unit * (0.13 + state.speechLevel * 0.035), unit * open, 0, 0, Math.PI * 2);
+          ctx.fillStyle = "#050505";
+          ctx.fill();
+          ctx.lineWidth = Math.max(2, unit * 0.025);
+          ctx.strokeStyle = "#fff";
+          ctx.stroke();
+          ctx.restore();
+        }
+        ctx.restore();
+      }
+
+      // Render complete frame with subtle void pulse and velocity squash/stretch
+      function renderFrame() {
+        ctx.fillStyle = "#000000";
+        ctx.fillRect(0, 0, state.width, state.height);
+
+        ctx.save();
+        // Subtle head/face translation & roll from mobile tilt and motion inertia
+        ctx.translate(state.faceOffsetX, state.faceOffsetY);
+        if (Math.abs(state.faceRoll) > 0.0005) {
+          ctx.translate(state.width * 0.5, state.height * 0.48);
+          ctx.rotate(state.faceRoll);
+          ctx.translate(-state.width * 0.5, -state.height * 0.48);
+        }
+
+        // Subtle atmospheric void darkness pulse during grin/surge transitions
+        if (state.voidPulseMix > 0.03) {
+          const pulse = 0.5 + 0.5 * Math.sin(state.time * 3.1);
+          const radius = Math.max(state.width, state.height) * 0.55;
+          const cx = state.width * 0.5;
+          const cy = state.height * 0.48;
+          const grad = ctx.createRadialGradient(cx, cy, radius * 0.08, cx, cy, radius);
+
+          if (state.blueMix > 0.4) {
+            grad.addColorStop(0, `rgba(18, 46, 92, ${0.14 * state.voidPulseMix * pulse})`);
+          } else if (state.redMix > 0.4) {
+            grad.addColorStop(0, `rgba(88, 14, 18, ${0.15 * state.voidPulseMix * pulse})`);
+          } else {
+            grad.addColorStop(0, `rgba(14, 52, 18, ${0.12 * state.voidPulseMix * pulse})`);
+          }
+          grad.addColorStop(1, "rgba(0, 0, 0, 0)");
+
+          ctx.fillStyle = grad;
+          ctx.fillRect(0, 0, state.width, state.height);
+        }
+
+        const minDim = Math.min(state.width, state.height);
+        const breathOffset = Math.sin(state.time * 2.4) * state.breathing;
+        const baseUnit = Math.max(66, Math.min(176, minDim * 0.25)) * (state.zoomScale + breathOffset);
+
+        // Velocity-based squash and stretch for lifelike physical momentum
+        const speed = Math.hypot(state.vx, state.vy);
+        const stretchAmt = Math.min(0.11, speed * 0.0085);
+        const horizVel = Math.abs(state.vx) >= Math.abs(state.vy);
+        const squashX = horizVel ? 1 + stretchAmt : 1 - stretchAmt * 0.7;
+        const squashY = horizVel ? 1 - stretchAmt * 0.7 : 1 + stretchAmt;
+
+        const eyeW = baseUnit * 0.63;
+        const eyeH = baseUnit * 0.57;
+        const eyeGap = baseUnit * 0.75;
+
+        const centerX = state.width * 0.5;
+        const centerY = state.height * 0.44;
+
+        const trackingBlend = state.isPointerDown
+          ? 1.0
+          : Math.min(1.0, state.pointerLockTimer / 0.85);
+        const tiltBlend = state.isPointerDown
+          ? 0.2
+          : Math.min(1.0, state.motionActiveTimer / 0.85);
+        const effectiveNudgeX = state.nudgeX * (1 - trackingBlend * 0.85);
+        const effectiveNudgeY = state.nudgeY * (1 - trackingBlend * 0.85);
+        const effectiveMicroX = state.microX * (1 - trackingBlend * 0.65);
+        const effectiveMicroY = state.microY * (1 - trackingBlend * 0.65);
+
+        const lookX = Math.max(-0.95, Math.min(0.95, state.gx + state.tiltGx * tiltBlend * 0.35 + effectiveMicroX + effectiveNudgeX));
+        const lookY = Math.max(-0.88, Math.min(0.88, state.gy + state.tiltGy * tiltBlend * 0.35 + effectiveMicroY + effectiveNudgeY));
+        const trailX = Math.max(-0.95, Math.min(0.95, state.trailGx + effectiveNudgeX));
+        const trailY = Math.max(-0.88, Math.min(0.88, state.trailGy + effectiveNudgeY));
+
+        // Left eye
+        drawEye(
+          centerX - eyeGap,
+          centerY,
+          eyeW,
+          eyeH,
+          true,
+          lookX,
+          lookY,
+          trailX,
+          trailY,
+          state.blinkAmount,
+          squashX,
+          squashY
+        );
+
+        // Right eye (features 4-point star gleam in blue/red grin modes)
+        drawEye(
+          centerX + eyeGap,
+          centerY,
+          eyeW,
+          eyeH,
+          false,
+          lookX,
+          lookY,
+          trailX,
+          trailY,
+          state.blinkAmount,
+          squashX,
+          squashY
+        );
+
+        // Mouth below eyes
+        drawMouth(
+          centerX + baseUnit * 0.03,
+          centerY + baseUnit * 1.12,
+          baseUnit,
+          lookX,
+          lookY,
+          squashX,
+          squashY
+        );
+
+        ctx.restore();
+      }
+
+      // Gentle pointer/touch nudge that yields back quickly to autonomous behavior
+      function applySubtleNudge(clientX, clientY) {
+        const nx = ((clientX / Math.max(1, state.width)) * 2 - 1) * 0.2;
+        const ny = ((clientY / Math.max(1, state.height)) * 2 - 1) * 0.16;
+        state.targetNudgeX = Math.max(-0.22, Math.min(0.22, nx));
+        state.targetNudgeY = Math.max(-0.18, Math.min(0.18, ny));
+        state.nudgeTimer = 0.75;
+      }
+
+      // Immediately direct gaze and reactive state toward touch or pointer coordinates
+      function handlePointerEngage(clientX, clientY, nowMs, isNewPress) {
+        const gaze = computeDirectPointerGaze(clientX, clientY);
+        state.pointerLookX = gaze.x;
+        state.pointerLookY = gaze.y;
+
+        let speed = state.pointerSpeed;
+        if (state.lastPointerX !== null && state.lastPointerY !== null && state.lastPointerMoveTime > 0) {
+          const dist = Math.hypot(clientX - state.lastPointerX, clientY - state.lastPointerY);
+          const elapsed = Math.max(8, nowMs - state.lastPointerMoveTime);
+          speed = dist / elapsed;
+        }
+        state.pointerSpeed = speed;
+        state.lastPointerX = clientX;
+        state.lastPointerY = clientY;
+        state.lastPointerMoveTime = nowMs;
+
+        state.isSweeping = false;
+        state.targetGx = gaze.x;
+        state.targetGy = gaze.y;
+        state.holdTimer = 0.65;
+
+        // Apply a crisp initial impulse on fresh touch/click so the eyes snap alive immediately
+        if (isNewPress) {
+          const isQuickDoubleTap = (nowMs - state.lastPointerDownTime) < 340;
+          state.lastPointerDownTime = nowMs;
+          state.pointerHoldDuration = 0;
+          state.pointerLockTimer = 1.65;
+
+          const dirX = gaze.x - state.gx;
+          const dirY = gaze.y - state.gy;
+          state.vx += dirX * 5.5;
+          state.vy += dirY * 5.5;
+
+          triggerTouchReaction(speed, isQuickDoubleTap);
+        } else {
+          state.pointerLockTimer = Math.max(state.pointerLockTimer, 1.35);
+        }
+
+        applySubtleNudge(clientX, clientY);
+      }
+
+      window.addEventListener("pointermove", function (e) {
+        if (e.pointerType === "mouse") {
+          if (state.isPointerDown) {
+            handlePointerEngage(e.clientX, e.clientY, performance.now(), false);
+          } else {
+            applySubtleNudge(e.clientX, e.clientY);
+          }
+        }
+      }, { passive: true });
+
+      window.addEventListener("pointerdown", function (e) {
+        requestMotionPermissionIfNeeded();
+        state.isPointerDown = true;
+        handlePointerEngage(e.clientX, e.clientY, performance.now(), true);
+      }, { passive: true });
+
+      function releasePointerHold() {
+        if (state.isPointerDown) {
+          state.isPointerDown = false;
+          // Hold attention briefly after release before smoothly relaxing into autonomous gaze
+          state.pointerLockTimer = Math.max(state.pointerLockTimer, 0.85);
+          state.holdTimer = Math.max(state.holdTimer, 0.45);
+        }
+      }
+
+      window.addEventListener("pointerup", releasePointerHold, { passive: true });
+      window.addEventListener("pointercancel", releasePointerHold, { passive: true });
+      window.addEventListener("blur", releasePointerHold, { passive: true });
+
+      let lastTime = performance.now();
+
+      function loop(now) {
+        const rawDt = (now - lastTime) / 1000;
+        lastTime = now;
+        const dt = Math.min(0.05, Math.max(0.001, rawDt));
+        state.time += dt;
+
+        updatePhysics(dt);
+        renderFrame();
+
+        requestAnimationFrame(loop);
+      }
+
+
+
+      // FACE AI native Android bridge + Gemini vision chat.
+      const video = document.getElementById("camera-preview");
+      let cameraStream=null, listening=false, lastUserText="", busy=false;
+      const nickname = localStorage.getItem("faceai.nickname") || "";
+      const welcome = document.getElementById("welcome");
+      const settings = document.getElementById("settings");
+      const nicknameInput = document.getElementById("nickname");
+      const apiInput = document.getElementById("api-key");
+      if (nickname) welcome.classList.add("hidden");
+      window.faceSpeakingStarted = function(){ state.speaking=true; state.speechLevel=.7; };
+      window.faceSpeakingEnded = function(){ state.speaking=false; state.speechLevel=0; };
+      function speak(text) {
+        state.speaking=true; state.speechLevel=.7;
+        if (window.FaceBridge && FaceBridge.speak) FaceBridge.speak(String(text));
+        else if ('speechSynthesis' in window) {
+          speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(text);
+          u.lang=/[\u0980-\u09FF]/.test(text)?'bn-BD':'en-US'; u.rate=.98; u.pitch=.92;
+          u.onend=()=>{state.speaking=false;state.speechLevel=0;}; speechSynthesis.speak(u);
+        }
+      }
+      async function startCamera() {
+        if (cameraStream) return true;
+        try {
+          cameraStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},audio:false});
+          video.srcObject=cameraStream; await video.play(); return true;
+        } catch(e) { speak('ক্যামেরা চালু করা যায়নি। Settings থেকে Camera permission চালু করো।'); return false; }
+      }
+      function stopCamera(){ if(cameraStream) cameraStream.getTracks().forEach(t=>t.stop()); cameraStream=null; video.srcObject=null; }
+      function frameData(){
+        if(!cameraStream || video.readyState<2) return null;
+        const c=document.createElement('canvas'); const max=768, scale=Math.min(1,max/video.videoWidth);
+        c.width=Math.round(video.videoWidth*scale); c.height=Math.round(video.videoHeight*scale);
+        c.getContext('2d').drawImage(video,0,0,c.width,c.height);
+        return c.toDataURL('image/jpeg',.72).split(',')[1];
+      }
+      async function askGemini(text, withImage=true) {
+        if(busy) return; busy=true;
+        const key=localStorage.getItem('faceai.geminiKey')||'';
+        if(!key){busy=false; speak('আমাকে বুদ্ধিমান AI করতে একবার Gemini API key সেট করতে হবে। আমার মুখে তিনবার ট্যাপ করে সেটিংস খোলো।'); return;}
+        const parts=[{text:`You are FACE AI, a warm, witty, concise Bengali-first voice assistant. User nickname: ${nickname||'friend'}. Reply naturally in the user's language, usually Bangla. Be truthful. If an image is attached, describe only what is clearly visible and never claim certainty about unclear details. User says: ${text}`}];
+        if(withImage){const image=frameData(); if(image) parts.push({inline_data:{mime_type:'image/jpeg',data:image}});}
+        try{
+          const res=await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key='+encodeURIComponent(key),{
+            method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({contents:[{parts}],generationConfig:{temperature:.7,maxOutputTokens:220}})
+          });
+          const data=await res.json();
+          if(!res.ok) throw new Error(data.error?.message||'API request failed');
+          const answer=(data.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('').trim();
+          speak(answer||'আমি উত্তর তৈরি করতে পারিনি। আবার বলো।');
+        }catch(e){speak('AI সংযোগে সমস্যা হয়েছে। ইন্টারনেট, API key অথবা free quota পরীক্ষা করো।');}
+        finally{busy=false;}
+      }
+      function onHeard(text){ listening=false; lastUserText=text; askGemini(text,true); }
+      window.onNativeSpeechResult = function(text){onHeard(text);};
+      window.onNativeSpeechError = function(){listening=false;};
+      function startListening(){
+        if(listening || busy) return;
+        if(window.FaceBridge && FaceBridge.startListening){listening=true; FaceBridge.startListening();}
+        else {const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR){speak('এই ব্রাউজারে voice recognition নেই। APK ভার্সন ব্যবহার করো।');return;}
+          const rec=new SR();rec.lang='bn-BD';rec.onresult=e=>onHeard(e.results[0][0].transcript);rec.onerror=()=>listening=false;rec.onend=()=>listening=false;listening=true;rec.start();}
+      }
+      document.getElementById('enter').addEventListener('click',async()=>{
+        const name=nicknameInput.value.trim(); if(!name){nicknameInput.focus();return;}
+        localStorage.setItem('faceai.nickname',name);
+        welcome.classList.add('hidden');
+        await startCamera();
+        speak('হ্যালো '+name+'! আমি তোমার Face AI। আমাকে ট্যাপ করে কথা বলো।');
+      });
+      document.getElementById('save-key').addEventListener('click',()=>{
+        const k=apiInput.value.trim(); if(k) localStorage.setItem('faceai.geminiKey',k);
+        settings.style.display='none'; apiInput.value=''; speak(k?'Gemini AI প্রস্তুত।':'API key পরিবর্তন করা হয়নি।');
+      });
+      document.getElementById('close-settings').addEventListener('click',()=>settings.style.display='none');
+      let tapCount=0,tapTimer=null,longPressTimer=null,longPressed=false;
+      canvas.addEventListener('pointerdown',()=>{
+        longPressed=false; longPressTimer=setTimeout(()=>{longPressed=true;settings.style.display='flex';apiInput.value='';},950);
+      });
+      canvas.addEventListener('pointerup',()=>{
+        clearTimeout(longPressTimer); if(longPressed)return;
+        tapCount++; if(tapTimer)clearTimeout(tapTimer);
+        tapTimer=setTimeout(()=>{if(tapCount>=3){settings.style.display='flex';apiInput.value='';}
+          else if(tapCount===2){startCamera().then(()=>askGemini('ক্যামেরায় এখন কী কী দেখতে পাচ্ছ?',true));}
+          else startListening(); tapCount=0;},260);
+      });
+      canvas.addEventListener('pointercancel',()=>clearTimeout(longPressTimer));
+      // Keep the camera session active after onboarding. The screen itself remains text-free.
+      window.addEventListener('pagehide',stopCamera);
+      setInterval(()=>{if(state.speaking)state.speechLevel=.22+Math.random()*.78;else state.speechLevel*=.55;},75);
+      window.addEventListener("resize", resize, { passive: true });
+      window.addEventListener("orientationchange", resize, { passive: true });
+
+      // Automatically attach motion sensors on non-iOS devices and prepare gesture trigger for iOS
+      if (
+        typeof DeviceOrientationEvent !== "undefined" &&
+        typeof DeviceOrientationEvent.requestPermission !== "function"
+      ) {
+        attachMotionListeners();
+      }
+
+      resize();
+      requestAnimationFrame(loop);
+    })();
+  </script>
+</body>
+</html>
