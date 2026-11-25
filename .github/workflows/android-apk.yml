@@ -4,7 +4,10 @@ name: Build FACE AI APK
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, master]
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -14,22 +17,91 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up JDK
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Gradle
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
+      - name: Fix project folders
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p app/src/main/assets
+          mkdir -p app/src/main/java/com/mahfuz/faceai
+
+          if [ -f AndroidManifest.xml ]; then
+            mv AndroidManifest.xml app/src/main/
+          fi
+
+          if [ -f MainActivity.kt ]; then
+            mv MainActivity.kt app/src/main/java/com/mahfuz/faceai/
+          fi
+
+          if [ -f index.html ]; then
+            mv index.html app/src/main/assets/
+          fi
+
+          if [ -f proguard-rules.pro ]; then
+            mv proguard-rules.pro app/
+          fi
+
+          test -f app/src/main/AndroidManifest.xml
+          test -f app/src/main/java/com/mahfuz/faceai/MainActivity.kt
+          test -f app/src/main/assets/index.html
+
+      - name: Configure Android app
+        run: |
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.mahfuz.faceai"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.mahfuz.faceai"
+                  minSdk = 23
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.webkit:webkit:1.12.1")
+          }
+          EOF
+
       - name: Build APK
-        run: gradle assembleDebug
+        run: gradle --no-daemon --stacktrace assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: FACE-AI-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
